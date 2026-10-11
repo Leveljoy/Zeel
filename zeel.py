@@ -10,11 +10,11 @@ from sqlalchemy import create_engine, text
 def get_db_engine():
     """Establishes a secure connection to your external permanent database."""
     try:
+        # Reads the flat configuration key directly to eliminate TOML errors
         db_url = st.secrets["supabase_url"]
-        # FIXED: Added pool parameters to handle connection preservation when app sleeps/reboots
-        return create_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
-    except Exception as e:
-        st.error(f"🚨 Supabase Connection Link Missing! Please add 'supabase_url' to your Streamlit Secrets panel. Error: {e}")
+        return create_engine(db_url)
+    except Exception:
+        st.error("🚨 Supabase Connection Link Missing! Please add 'supabase_url' to your Streamlit Secrets panel.")
         return None
 
 engine = get_db_engine()
@@ -72,7 +72,6 @@ def calculate_expected_cycles(start_date_str):
         month_index += 1
         
     return all_cycles
-
 def get_loan_summary(loan_id, principal_lent, interest_rate_month, start_date):
     """Calculates active live metrics, balances, deadlines, and lateness."""
     if engine is None:
@@ -132,6 +131,7 @@ def get_master_dataframe():
         computed_rows.append(combined_record)
 
     return pd.DataFrame(computed_rows)
+
 # =====================================================================
 # 3. STREAMLIT USER INTERFACE & LAYOUT CONTROLLERS
 # =====================================================================
@@ -157,7 +157,6 @@ if __name__ == "__main__":
     st.markdown("---")
 
     tab1, tab2, tab3, tab4 = st.tabs(["📋 Master Portfolio View", "➕ Create New Loan", "💸 Record Payments", "✏️ Edit Historic Transactions"])
-    
     # TAB 1: OPERATIONAL LEDGER & TIME BLOCK CHIPS
     with tab1:
         st.subheader("Live Operational Loan Ledger")
@@ -177,65 +176,116 @@ if __name__ == "__main__":
             selected_timeline_id = st.selectbox("Filter Timeline By Borrower Profile:", options=list(borrower_opts.keys()), format_func=lambda x: borrower_opts[x])
 
             if selected_timeline_id:
-                # FIXED: Safely extracting data series from dataframe to prevent parsing crashes
-                b_row = df_master[df_master["id"] == selected_timeline_id].iloc[0]
+                b_row = df_master[df_master["id"] == selected_timeline_id].iloc
                 with engine.connect() as conn:
                     df_tx_ledger = pd.read_sql(text("SELECT * FROM transactions WHERE loan_id = :id"), conn, params={"id": int(selected_timeline_id)})
 
                 st.markdown(f"### **Timeline History for {b_row['borrower_name']}**")
-                
-                if not df_tx_ledger.empty:
-                    st.dataframe(df_tx_ledger[["transaction_date", "total_received", "interest_paid", "principal_paid", "billing_cycle_num"]], use_container_width=True, hide_index=True)
-                else:
-                    st.warning("No payments recorded yet for this profile.")
-    # TAB 2: CREATE NEW LOAN
+                all_cycles = calculate_expected_cycles(b_row["initial_loan_date"])
+                all_cycles.reverse()
+
+                if all_cycles:
+                    cols = st.columns(len(all_cycles))
+                    for idx, cycle in enumerate(all_cycles):
+                        with cols[idx]:
+                            cycle_txs = df_tx_ledger[df_tx_ledger["billing_cycle_num"] == cycle["index"]] if not df_tx_ledger.empty else pd.DataFrame()
+                            cycle_total = cycle_txs["total_received"].sum() if not cycle_txs.empty else 0.0
+                            cycle_interest = cycle_txs["interest_paid"].sum() if not cycle_txs.empty else 0.0
+                            cycle_principal = cycle_txs["principal_paid"].sum() if not cycle_txs.empty else 0.0
+
+                            today_dt = datetime.today().date()
+                            is_overdue = (today_dt >= cycle["due_deadline"]) and cycle_txs.empty
+                            days_overdue = (today_dt - cycle["due_deadline"]).days if is_overdue else 0
+
+                            if is_overdue:
+                                box_style = "border: 2px solid #ff4b4b; background-color: #ffebe6; padding: 15px; border-radius: 10px; margin-bottom: 10px; color: black;"
+                                status_text = f"🚨 **LATE OVERDUE**<br><span style='color:#ff4b4b; font-weight:bold;'>Overdue by {days_overdue} Days!</span>"
+                            elif cycle_txs.empty:
+                                box_style = "border: 1px solid #ffaa00; background-color: #fff9e6; padding: 15px; border-radius: 10px; margin-bottom: 10px; color: black;"
+                                status_text = f"⏳ **Active Cycle**<br><span style='color:#cc8800;'>Due: {cycle['due_deadline'].strftime('%b %d')}</span>"
+                            else:
+                                box_style = "border: 1px solid #00cc66; background-color: #e6f9f0; padding: 15px; border-radius: 10px; margin-bottom: 10px; color: black;"
+                                status_text = "✅ **Paid/Processed**"
+
+                            st.components.v1.html(f"""
+                                <div style="{box_style} font-family: sans-serif; box-sizing: border-box; height: 160px;">
+                                    <h4 style="margin: 0 0 5px 0; color: black; font-size: 1.1em;">📅 Month {cycle['index']}</h4>
+                                    <small style="color: gray; font-size: 0.8em;">Due Deadline: {cycle['due_deadline'].strftime('%b %d, %Y')}</small>
+                                    <hr style="margin: 8px 0; border: 0; border-top: 1px solid #ccc;">
+                                    <div style="font-size: 0.9em; margin-bottom: 8px;">{status_text}</div>
+                                    <p style="margin: 0; font-size: 0.85em; color: black; line-height: 1.4;">
+                                        💰 Total Rec: <b>${cycle_total:,.2f}</b><br>
+                                        📉 To Principal: <b>${cycle_principal:,.2f}</b><br>
+                                        🏷️ To Interest: <b>${cycle_interest:,.2f}</b>
+                                    </p>
+                                </div>
+                            """, height=180, scrolling=False)
+
+    # TAB 2: ORIGINATE NEW LOAN
     with tab2:
-        st.subheader("Add a New Loan Agreement")
-        with st.form("new_loan_form", clear_on_submit=True):
+        st.subheader("Originate New Loan Contract")
+        with st.form("create_loan_form", clear_on_submit=True):
             b_name = st.text_input("Borrower Full Name")
-            p_lent = st.number_input("Principal Lent Amount ($)", min_value=0.0, step=100.0)
-            i_rate = st.number_input("Monthly Interest Rate (%)", min_value=0.0, step=0.1)
-            start_d = st.date_input("Initial Loan Date", datetime.today())
-            
-            submit_loan = st.form_submit_button("Save Loan To Database")
-            
-            if submit_loan and b_name:
-                if engine:
+            p_lent = st.number_input("Principal Lent Amount ($)", min_value=0.01, step=100.0)
+            i_rate = st.number_input("Monthly Interest Rate Percentage (%)", min_value=0.0, step=0.1)
+            init_date = st.date_input("Initial Loan Issuance Date", value=datetime.today() - timedelta(days=30))
+
+            if st.form_submit_button("Create Loan Entry"):
+                if b_name and engine:
                     with engine.begin() as conn:
-                        conn.execute(text("""
-                            INSERT INTO loans (borrower_name, principal_lent, interest_rate_month, initial_loan_date, status)
-                            VALUES (:name, :principal, :rate, :start_date, 'Active')
-                        """), {"name": b_name, "principal": p_lent, "rate": i_rate, "start_date": start_d.strftime("%Y-%m-%d")})
-                    st.success(f"🎉 Loan safely saved for {b_name}!")
+                        conn.execute(text("INSERT INTO loans (borrower_name, principal_lent, interest_rate_month, initial_loan_date) VALUES (:name, :lent, :rate, :date)"),
+                                     {"name": b_name, "lent": p_lent, "rate": i_rate, "date": str(init_date)})
+                    st.success(f"Recorded new loan contract for {b_name}!")
                     st.rerun()
 
-    # TAB 3: RECORD PAYMENTS
+    # TAB 3: POST TRANSACTION MANUALLY TO A BLOCK CHIP
     with tab3:
-        st.subheader("Record Incoming Payment Receipt")
+        st.subheader("Post Inbound Transaction with Manual Block Target")
         if df_master.empty:
-            st.info("No active open loans to process payments for.")
+            st.warning("No active profiles available to post collections.")
         else:
-            with st.form("payment_form", clear_on_submit=True):
-                borrower_opts = {row["id"]: f"{row['borrower_name']} (ID: {row['id']})" for _, row in df_master.iterrows()}
-                pay_loan_id = st.selectbox("Select Active Borrower Profile:", options=list(borrower_opts.keys()), format_func=lambda x: borrower_opts[x])
-                pay_date = st.date_input("Transaction Date", datetime.today())
-                total_rec = st.number_input("Total Amount Received ($)", min_value=0.0, step=10.0)
-                int_paid = st.number_input("Allocated to Interest Paid ($)", min_value=0.0, step=10.0)
-                prin_paid = st.number_input("Allocated to Principal Paid ($)", min_value=0.0, step=10.0)
+            loan_options = {row["id"]: f"ID {row['id']} | {row['borrower_name']}" for _, row in df_master.iterrows()}
+            selected_loan_id = st.selectbox("Select Borrower Profile", options=list(loan_options.keys()), format_func=lambda x: loan_options[x], key="tx_borrower_box")
+            
+            loan_row = df_master[df_master["id"] == selected_loan_id].iloc
+            available_blocks = calculate_expected_cycles(loan_row["initial_loan_date"])
+            block_options = {b["index"]: f"Month {b['index']} (Due: {b['due_deadline'].strftime('%b %d, %Y')})" for b in available_blocks}
+            
+            with st.form("manual_post_form", clear_on_submit=True):
+                target_block = st.selectbox("Choose Target Billing Block for Payment:", options=list(block_options.keys()), format_func=lambda x: block_options[x])
+                tx_date = st.date_input("Payment Date Received", value=datetime.today())
+                total_rec = st.number_input("Total Money Received ($)", min_value=0.00, step=50.0)
+                interest_p = st.number_input("Portion Allocated to Interest ($)", min_value=0.00, step=10.0)
+                principal_p = st.number_input("Portion Allocated to Main Principal ($)", min_value=0.00, step=50.0)
 
-                submit_pay = st.form_submit_button("Commit Payment Entry")
-                
-                if submit_pay:
-                    if engine:
+                if st.form_submit_button("Post Transaction Row"):
+                    if round(interest_p + principal_p, 2) != round(total_rec, 2):
+                        st.error("Validation Error: Allocation components do not match Total Received.")
+                    elif engine:
                         with engine.begin() as conn:
-                            conn.execute(text("""
-                                INSERT INTO transactions (loan_id, transaction_date, total_received, interest_paid, principal_paid)
-                                VALUES (:loan_id, :tx_date, :total, :interest, :principal)
-                            """), {"loan_id": pay_loan_id, "tx_date": pay_date.strftime("%Y-%m-%d"), "total": total_rec, "interest": int_paid, "principal": prin_paid})
-                        st.success("💸 Payment transaction completely logged into Cloud Storage!")
+                            conn.execute(text("INSERT INTO transactions (loan_id, transaction_date, total_received, interest_paid, principal_paid, billing_cycle_num) VALUES (:l_id, :date, :tot, :int, :prin, :cyc)"),
+                                         {"l_id": int(selected_loan_id), "date": str(tx_date), "tot": total_rec, "int": interest_p, "prin": principal_p, "cyc": int(target_block)})
+                            
+                            metrics = get_loan_summary(selected_loan_id, loan_row["principal_lent"], loan_row["interest_rate_month"], loan_row["initial_loan_date"])
+                            if metrics["remaining_principal"] <= 0:
+                                conn.execute(text("UPDATE loans SET status='Paid Off' WHERE id=:id"), {"id": int(selected_loan_id)})
+                        st.success(f"Payment posted and successfully locked to Month {target_block} block!")
                         st.rerun()
 
-    # TAB 4: PLACEHOLDER FOR EDIT HISTORIC TRANSACTIONS
+    # TAB 4: AUDIT TOOL & PROFILE DESTROYER
     with tab4:
-        st.subheader("Manage Historical Ledger Entries")
-        st.info("This administrative section allows correcting payment logs manually if needed.")
+        st.subheader("Historic Modifications Ledger Audit Tool")
+        if engine:
+            with engine.connect() as conn:
+                df_all_tx = pd.read_sql(text("SELECT transactions.id as tx_id, loans.borrower_name, transactions.transaction_date, transactions.total_received, transactions.interest_paid, transactions.principal_paid, transactions.billing_cycle_num FROM transactions JOIN loans ON transactions.loan_id = loans.id"), conn)
+        else:
+            df_all_tx = pd.DataFrame()
+
+        if df_all_tx.empty:
+            st.info("No transaction records logged yet.")
+        else:
+            tx_selection_map = {row["tx_id"]: f"Tx #{row['tx_id']} | {row['borrower_name']} | Target Block: Month {row['billing_cycle_num']} | Total: ${row['total_received']}" for _, row in df_all_tx.iterrows()}
+            selected_tx_id = st.selectbox("Select Target Historical Entry to Edit", options=list(tx_selection_map.keys()), format_func=lambda x: tx_selection_map[x])
+            target_tx = df_all_tx[df_all_tx["tx_id"] == selected_tx_id].iloc
+
+            with st.form("edit_tx_form"):
