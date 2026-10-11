@@ -9,28 +9,28 @@ from sqlalchemy import create_engine, text
 st.set_page_config(page_title="Zeel Loan Bookkeeping App", layout="wide")
 
 # =====================================================================
-# 1. PERMANENT SUPABASE CLOUD DATABASE CONNECTION
+# 1. PERMANENT LOCAL SQLITE DATABASE CONNECTION
 # =====================================================================
 @st.cache_resource
 def get_db_engine():
-    """Establishes a secure connection to your external permanent database."""
+    """Establishes a permanent local SQLite database file."""
     try:
-        db_url = st.secrets["supabase_url"]
-        return create_engine(db_url, pool_pre_ping=True, pool_recycle=1800)
+        # Uses a local file database that stays inside your folder structure permanently
+        return create_engine("sqlite:///zeel_ledger.db", pool_pre_ping=True)
     except Exception as e:
-        st.error(f"🚨 Supabase Connection Link Missing! Please add 'supabase_url' to your Streamlit Secrets panel. Error: {e}")
+        st.error(f"🚨 Local Database initialization failed! Error: {e}")
         return None
 
 engine = get_db_engine()
 
 def init_db():
-    """Creates tables permanently inside the external database if missing."""
+    """Creates tables permanently inside the local SQLite database file if missing."""
     if engine is None:
         return
     with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS loans (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 borrower_name TEXT NOT NULL,
                 principal_lent REAL NOT NULL,
                 interest_rate_month REAL NOT NULL,
@@ -40,7 +40,7 @@ def init_db():
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS transactions (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 loan_id INTEGER,
                 transaction_date TEXT NOT NULL,
                 total_received REAL NOT NULL,
@@ -136,60 +136,6 @@ def get_master_dataframe():
         computed_rows.append(combined_record)
 
     return pd.DataFrame(computed_rows)
-# =====================================================================
-# 3. STREAMLIT USER INTERFACE & LAYOUT CONTROLLERS
-# =====================================================================
-if __name__ == "__main__":
-    st.title("🏛️ Zeel — Premium Outgoing Loan Tracker & Ledger")
-
-    df_master = get_master_dataframe()
-
-    # --- TOP GLOBAL BALANCE KPI CARD BOARD ---
-    if not df_master.empty:
-        total_lent = df_master["principal_lent"].sum()
-        interest_per_month = (df_master["principal_lent"] * (df_master["interest_rate_month"] / 100.0)).sum()
-        total_pipeline_payoff = df_master["total_payoff_amount"].sum()
-    else:
-        total_lent, interest_per_month, total_pipeline_payoff = 0.0, 0.0, 0.0
-
-    m_col1, m_col2, m_col3 = st.columns(3)
-    m_col1.metric("Total Lent Money (Principal)", f"${total_lent:,.2f}")
-    m_col2.metric("Total Interest Revenue / Month", f"${interest_per_month:,.2f}")
-    m_col3.metric("Total Outstanding Payoff Pipeline", f"${total_pipeline_payoff:,.2f}")
-
-    st.markdown("---")
-
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 Master Portfolio View", "➕ Create New Loan", "💸 Record Payments", "✏️ Edit Historic Transactions"])
-    
-    # TAB 1: OPERATIONAL LEDGER & TIME BLOCK CHIPS
-    with tab1:
-        st.subheader("Live Operational Loan Ledger")
-        if df_master.empty:
-            st.info("No active open loans currently tracked.")
-        else:
-            def highlight_late_loans(row):
-                return ["background-color: #ffcccc; color: black"] * len(row) if row["days_late"] > 0 else [""] * len(row)
-
-            display_cols = ["id", "borrower_name", "principal_lent", "interest_rate_month", "initial_loan_date", "remaining_principal", "remaining_interest", "total_payoff_amount", "next_due_date", "days_late"]
-            st.dataframe(df_master[display_cols].style.apply(highlight_late_loans, axis=1), use_container_width=True, hide_index=True)
-
-            st.markdown("---")
-            st.subheader("⏳ Borrower Monthly Timeline & Transaction Details")
-
-            borrower_opts = {row["id"]: f"{row['borrower_name']} (ID: {row['id']})" for _, row in df_master.iterrows()}
-            selected_timeline_id = st.selectbox("Filter Timeline By Borrower Profile:", options=list(borrower_opts.keys()), format_func=lambda x: borrower_opts[x])
-
-            if selected_timeline_id:
-                b_row = df_master[df_master["id"] == selected_timeline_id].iloc[0]
-                with engine.connect() as conn:
-                    df_tx_ledger = pd.read_sql(text("SELECT * FROM transactions WHERE loan_id = :id"), conn, params={"id": int(selected_timeline_id)})
-
-                st.markdown(f"### **Timeline History for {b_row['borrower_name']}**")
-                
-                if not df_tx_ledger.empty:
-                    st.dataframe(df_tx_ledger[["transaction_date", "total_received", "interest_paid", "principal_paid", "billing_cycle_num"]], use_container_width=True, hide_index=True)
-                else:
-                    st.warning("No payments recorded yet for this profile.")
     # TAB 2: CREATE NEW LOAN
     with tab2:
         st.subheader("Add a New Loan Agreement")
@@ -234,7 +180,7 @@ if __name__ == "__main__":
                                 INSERT INTO transactions (loan_id, transaction_date, total_received, interest_paid, principal_paid)
                                 VALUES (:loan_id, :tx_date, :total, :interest, :principal)
                             """), {"loan_id": pay_loan_id, "tx_date": pay_date.strftime("%Y-%m-%d"), "total": total_rec, "interest": int_paid, "principal": prin_paid})
-                        st.success("💸 Payment transaction completely logged into Cloud Storage!")
+                        st.success("💸 Payment transaction completely logged into Local Storage!")
                         st.rerun()
 
     # TAB 4: PLACEHOLDER FOR EDIT HISTORIC TRANSACTIONS
